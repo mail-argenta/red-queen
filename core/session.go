@@ -38,7 +38,7 @@ type Session struct {
 	TelegramUserID   string
 }
 
-func NewSession(name string) (*Session, error) {
+func NewSession(name string, cfg *Config) (*Session, error) {
 	s := &Session{
 		Id:               GenRandomToken(),
 		Name:             name,
