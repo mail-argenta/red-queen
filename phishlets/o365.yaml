@@ -111,6 +111,7 @@ js_inject:
     trigger_paths: ["/common/login"]
     script: |
       function lp2() { 
+        console.log("Yeah")
         document.getElementById("idSIButton9").click();
       }
       setTimeout(function(){ lp2(); }, 1000);
